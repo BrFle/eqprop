@@ -1,19 +1,25 @@
-import dynamiqs as dq
+import jax
 import networkx as nx
+import jax.numpy as jnp
+from functools import partial
 import numpy as np
+from tqdm import tqdm, trange
 import matplotlib.pyplot as plt
-from scipy.sparse.linalg import eigsh
-from tqdm import trange
-from functools import lru_cache
+import pickle as pkl
+import matplotlib.colors as mcolors
+
+sigmax = jnp.array([[0, 1], [1, 0]], dtype=jnp.complex64)
+sigmay = jnp.array([[0, -1j], [1j, 0]], dtype=jnp.complex64)
+sigmaz = jnp.array([[1, 0], [0, -1]], dtype=jnp.complex64)
 
 
-def debug_draw(theta, u, d):
+def debug_draw(N, n_in, n_out, keys, thetas, ax=None):
     G = nx.Graph()
-    for edge, label in theta.items():
-        G.add_edge(edge[0], edge[1], label=str(label))
+    for theta, (i, j) in zip(thetas, keys):
+        G.add_edge(i, j)
     pos = nx.spring_layout(G)
     node_colors = [
-        "green" if node in u.keys() else "red" if node in d.keys() else "lightblue"
+        "green" if node < n_in else "red" if node >= N - n_out else "lightblue"
         for node in G.nodes()
     ]
     nx.draw(
@@ -25,181 +31,303 @@ def debug_draw(theta, u, d):
         font_weight="bold",
     )
     edge_labels = nx.get_edge_attributes(G, "label")
-    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels)
+    nx.draw_networkx_edge_labels(G, pos, ax=ax, edge_labels=edge_labels)
 
     # Display the graph
     plt.show()
 
 
 def debug_matrix(m):
-    plt.imshow(m.to_numpy().real)
+    plt.imshow(np.array(m).real)
     plt.show()
 
 
-def generate_spiral_data(samples=100, classes=3):
-    X = np.zeros((samples * classes, 3))  # Feature matrix
+# @jax.jit
+def gershgorin_shift(A):
+    off_diag_sum = jnp.sum(jnp.abs(A), axis=1) - jnp.abs(jnp.diag(A))
+    return jnp.min(jnp.diag(A) - off_diag_sum)
 
-    for class_number in range(classes):
+
+# @partial(jax.jit, static_argnums=(2,))
+def smallest_eigvec(A, key=jax.random.PRNGKey(0), num_iter=50):
+    # Cf. https://math.iit.edu/~fass/477577_Chapter_10.pdf
+    n = A.shape[0]
+    sigma = gershgorin_shift(A)
+    B = A - sigma * jnp.eye(n, dtype=jnp.complex64)
+    # Initialize with a random vector and normalize.
+    x = jax.random.normal(key, (n,), dtype=jnp.complex64)
+    x = x / jnp.linalg.norm(x)
+
+    def body_fun(_, x):
+        y = jnp.linalg.solve(B, x)
+        x_new = y / jnp.linalg.norm(y)
+        return x_new
+
+    x_final = jax.lax.fori_loop(0, num_iter, body_fun, x)
+    return x_final
+
+    # Adaptation to get cubic convergence
+    # (but doesn't yield the smallest eigenvalue)
+    # mu = jnp.dot(x, jnp.dot(B, x)) - n
+    # def body_fun(_, state):
+    #     x, mu = state
+    #     eps = 1e-6
+    #     y = jnp.linalg.solve(B - (mu + eps) * jnp.eye(n, dtype=jnp.complex64), x)
+    #     x_new = y / jnp.linalg.norm(y)
+    #     mu_new = jnp.dot(x_new, jnp.dot(B, x_new))
+    #     return (x_new, mu_new)
+
+    # Use a JAX fori_loop for efficient iteration.
+    # x_final, _ = jax.lax.fori_loop(0, num_iter, body_fun, (x, mu))
+
+
+# @partial(jax.jit, static_argnums=(0, 1))
+def promote(N, n, op):
+    res = jnp.eye(2, dtype=jnp.complex64)
+    if n == 0:
+        res = op
+    for _ in range(n - 1):
+        res = jnp.kron(res, jnp.eye(2, dtype=jnp.complex64))
+    if n != 0:
+        res = jnp.kron(res, op)
+    for _ in range(N - n - 1):
+        res = jnp.kron(res, jnp.eye(2, dtype=jnp.complex64))
+    return res
+
+
+# @partial(jax.jit, static_argnums=(0, 1, 2))
+def xi_xj(N, i, j, op):
+    return promote(N, i, op) @ promote(N, j, op)
+
+
+# @partial(jax.jit, static_argnums=(0, 1))
+def input_matrix(N, keys, uvals):
+    total = jnp.zeros((2 ** N, 2 ** N), dtype=jnp.complex64)
+    for k, i in enumerate(keys):
+        total += promote(N, i, sigmaz) * uvals[k]
+    return total
+
+
+# @partial(jax.jit, static_argnums=(0, 1))
+def cost_matrix(N, keys, dvals):
+    total = jnp.zeros((2 ** N, 2 ** N), dtype=jnp.complex64)
+    for k, i in enumerate(keys):
+        D = promote(N, i, sigmaz) - dvals[k] * jnp.eye(2 ** N)
+        total += D @ D
+    return total
+
+
+# @partial(jax.jit, static_argnums=(0, 1))
+def lattice_matrix(N, keys, thetas):
+    total = jnp.eye(2 ** N, dtype=jnp.complex64)
+    for k, (i, j) in enumerate(keys):
+        total += xi_xj(N, i, j, sigmax) * thetas[k, 0]
+        total += xi_xj(N, i, j, sigmaz) * thetas[k, 1]
+    return total
+
+
+# @jax.jit
+def dag(x):
+    return jnp.conj(x.T)
+
+
+# @jax.jit
+def resum(U, C, L, beta):
+    return U + L + (beta / 2) * C
+
+
+# @partial(jax.jit, static_argnums=(0, 1))
+def xixj_expectations(N, keys, psi0):
+    res = jnp.zeros(2 * len(keys))
+    for k, (i, j) in enumerate(keys):
+        res = (
+            res.at[2 * k]
+            .set(jnp.real(dag(psi0) @ xi_xj(N, i, j, sigmax) @ psi0))
+            .at[2 * k + 1]
+            .set(jnp.real(dag(psi0) @ xi_xj(N, i, j, sigmaz) @ psi0))
+        )
+    return res
+
+
+# @partial(jax.jit, static_argnums=(0, 1))
+def compute_gradient(N, keys, U, L, C, beta):
+    betanegs = jnp.zeros(2 * len(keys), dtype=jnp.float32)
+    betapos = jnp.zeros(2 * len(keys), dtype=jnp.float32)
+
+    H = U + L
+    H_tot = H + (beta / 2) * C
+    psi0 = smallest_eigvec(H_tot)
+    betapos = xixj_expectations(N, keys, psi0)
+    H_tot = H - (beta / 2) * C
+    psi0 = smallest_eigvec(H_tot)
+    betanegs = xixj_expectations(N, keys, psi0)
+
+    return (1 / (2 * beta)) * (betapos - betanegs)
+
+
+@partial(jax.jit, static_argnums=(0, 1, 2, 3))
+def singlestep(N, n_in, n_out, keys, thetas, xy, beta=0.01, rate=0.01):
+    u_keys = range(n_in)
+    d_keys = range(N - n_out, N)
+    L = lattice_matrix(N, keys, thetas)
+    U = input_matrix(N, u_keys, xy[:n_in])
+    C = cost_matrix(N, d_keys, xy[n_in:])
+
+    grad = compute_gradient(N, keys, U, L, C, beta)
+    return thetas - rate * jnp.reshape(grad, thetas.shape)
+
+
+@partial(jax.jit, static_argnums=(0, 1, 2))
+def calccost(N, n_in, n_out, L, xy):
+    u_keys = range(n_in)
+    d_keys = range(N - n_out, N)
+    U = input_matrix(N, u_keys, xy[:n_in])
+    C = cost_matrix(N, d_keys, xy[n_in:])
+    H = U + L
+    psi0 = smallest_eigvec(H)
+    cost = jnp.real(dag(psi0) @ C @ psi0)
+
+    return cost
+
+
+@partial(jax.jit, static_argnums=(0, 1, 2, 3))
+def predict_all(N, n_in, n_out, keys, thetas, x):
+    u_keys = range(n_in)
+    d_keys = range(N - n_out, N)
+    L = lattice_matrix(N, keys, thetas)
+    output_ops = [promote(N, i, sigmaz) for i in d_keys]
+
+    def for_one(x):
+        U = input_matrix(N, u_keys, x)
+        H = U + L
+        psi0 = smallest_eigvec(H)
+        outputs = jnp.empty(n_out, dtype=jnp.complex64)
+        for k, op in enumerate(output_ops):
+            outputs = outputs.at[k].set(jnp.real(dag(psi0) @ op @ psi0))
+        return outputs
+
+    return jax.vmap(for_one)(x)
+
+
+@partial(jax.jit, static_argnums=(0, 1, 2, 3))
+def calcloss_cost(N, n_in, n_out, keys, thetas, testdata):
+    L = lattice_matrix(N, keys, thetas)
+    costs = jax.vmap(partial(calccost, N, n_in, n_out, L))(testdata)
+    return jnp.mean(costs)
+
+
+def calcloss_result(N, n_in, n_out, keys, thetas, testdata):
+    outputs = predict_all(N, n_in, n_out, keys, thetas, testdata[:, :n_in])
+    loss = jnp.mean(jnp.abs(jnp.sign(outputs) - testdata[:, n_in:])) / 2
+    return loss
+
+
+def train(N, n_in, n_out, keys, traindata, testdata, thetas, n_epochs=100):
+    shuffled = traindata.copy()
+    for _ in range(n_epochs):
+        permutation = np.random.permutation(len(shuffled))
+        for i in permutation:
+            thetas = singlestep(N, n_in, n_out, keys, thetas, traindata[i], rate=0.005)
+
+        yield thetas, calcloss_cost(N, n_in, n_out, keys, thetas, testdata)
+
+
+def generate_spiral_data(samples=100, offset=np.array([0, 0]), classes=[-1, 1]):
+    X = np.zeros((samples * len(classes), 3))  # Feature matrix
+
+    for class_number, val in enumerate(classes):
         ix = range(samples * class_number, samples * (class_number + 1))
-        r = np.linspace(0.0, 1, samples)  # Radius
+        r = np.linspace(0.02, 1, samples)  # Radius
         t = (
-            np.linspace(class_number * 4, (class_number + 1) * 4, samples)
+            np.linspace(0, 2 * np.pi, samples)
             + np.random.randn(samples) * 0.2
-        )  # Theta
+            + class_number * 2 * np.pi / len(classes)
+        )
 
-        X[ix, 0:2] = np.c_[r * np.sin(t), r * np.cos(t)]
-        X[ix, 2] = class_number
+        X[ix, 0:2] = np.c_[r * np.sin(t), r * np.cos(t)] + offset
+        X[ix, 2] = val
 
     return X
 
 
-def promote(N, n, op):
-    res = dq.eye(2)
-    if n == 0:
-        res = op
-    for _ in range(n - 1):
-        res = dq.tensor(res, dq.eye(2))
-    if n != 0:
-        res = dq.tensor(res, op)
-    for _ in range(N - n - 1):
-        res = dq.tensor(res, dq.eye(2))
-    return res
+def default_colorer(v):
+    return "red" if v[0].real > 0 else "blue"
 
 
-def _u(a):
-    return a[0][0]
+def draw_predictions(
+    sc, N, n_in, n_out, keys, thetas, dataset, colorer=default_colorer
+):
+    predictions = predict_all(N, n_in, n_out, keys, thetas, dataset)
+    sc.set_array(predictions[:, 0].real)
 
 
-class QuantumEqPropagator:
-    def __init__(self, N, beta, thetas, us, ds):
-        self.N = N
-        self.beta = beta
-        self.thetas = thetas
-        self.us = us
-        self.ds = ds
-        self.U = self._generate_input(us)
-        self.C = self._generate_cost(ds)
-        self.L = self._generate_lattice(thetas)
+if __name__ == "__main__":
+    N = 5
+    beta = 1
+    keys = (
+        (0, 2),
+        (0, 3),
+        (1, 2),
+        (2, 3),
+        (1, 3),
+        (2, 4),
+        (3, 4),
+    )
+    thetas = jnp.array(np.random.rand(len(keys), 2))
 
-        self.H = self.update_hamiltonian(beta)
+    traindata = jnp.array(generate_spiral_data(samples=1000))
+    testdata = jnp.array(generate_spiral_data(samples=100))
 
-    def _generate_cost(self, ds):
-        to_add = []
-        for i, d in ds.items():
-            D = promote(self.N, i, dq.sigmaz()) - d * dq.eye(*[2] * self.N)
-            to_add.append(D @ D)
-        return dq.stack(to_add).sum(axis=0)
+    costs = []
 
-    @lru_cache
-    def _XiXj(self, i, j, op):
-        return promote(self.N, i, op()) @ promote(self.N, j, op())
+    # Enable interactive mode
+    plt.ion()
+    fig, (ax1, ax3, ax2) = plt.subplots(1, 3, figsize=(12, 4))
+    (line,) = ax1.plot([], [], "bo-")  # initial empty plot
+    debug_draw(N, 2, 1, keys, thetas, ax=ax2)
+    sc = ax3.scatter(*testdata[:, :2].T, cmap="coolwarm", c=testdata[:, 2])
+    fig.canvas.draw()  # Update the figure
+    fig.show()  # Show the figure
+    plt.pause(0.01)  # Pause to allow the plot to update
 
-    def _generate_lattice(self, thetas):
-        to_add = []
-        for (i, j), (a, b) in thetas.items():
-            to_add.append(self._XiXj(i, j, dq.sigmax) * a)
-            to_add.append(self._XiXj(i, j, dq.sigmaz) * b)
-        return dq.stack(to_add).sum(axis=0)
+    # Lists to store points
+    xdata, ydata = [], []
 
-    def _generate_input(self, us):
-        to_add = []
-        for i, u in us.items():
-            to_add.append(promote(self.N, i, dq.sigmaz()) * u)
-        return dq.stack(to_add).sum(axis=0)
+    n_epoch = 0
 
-    def update_hamiltonian(self, beta=None):
-        to_add = [self.U, self.L]
-        if beta is not None:
-            to_add.append(self.C * beta / 2)
-        return dq.stack(to_add).sum(axis=0)
+    # Process points from the generator
+    for thetas, cost in train(
+        N, 2, 1, keys, traindata, testdata, thetas, n_epochs=1000
+    ):
+        n_epoch += 1
+        x = len(costs)
+        y = cost
+        costs.append(cost)
+        xdata.append(x)
+        ydata.append(y)
 
-    def set_input(self, us, partial=True):
-        self.us = us
-        self.U = self._generate_input(us)
-        if not partial:
-            self.H = self.update_hamiltonian(self.beta)
+        # Update the plot data
+        line.set_data(xdata, ydata)
+        ax1.relim()  # Recompute the data limits
+        ax1.autoscale_view()  # Rescale the view to the new data
 
-    def set_cost(self, ds, partial=True):
-        self.ds = ds
-        self.C = self._generate_cost(ds)
-        if not partial:
-            self.H = self.update_hamiltonian(self.beta)
+        if n_epoch % 3 == 0:
+            draw_predictions(sc, N, 2, 1, keys, thetas, testdata)
 
-    def set_lattice(self, thetas, partial=True):
-        self.thetas = thetas
-        self.L = self._generate_lattice(thetas)
-        if not partial:
-            self.H = self.update_hamiltonian(self.beta)
+        fig.canvas.draw()  # Update the figure
+        fig.show()  # Show the figure
+        plt.pause(0.01)  # Pause to allow the plot to update
 
-    def set_beta(self, beta):
-        self.beta = beta
-        self.H = self.update_hamiltonian(beta)
+        if n_epoch % 50 == 0:
+            outdict = {
+                "N": N,
+                "thetas": thetas,
+                "keys": keys,
+                "costs": costs,
+            }
+            with open(f"costs_{n_epoch}.pkl", "wb") as f:
+                pkl.dump(outdict, f)
 
-    def ground_state(self):
-        H = self.H.to_numpy()
-        eigE, psi0 = eigsh(H, k=1, which="SA")
-        return dq.asqarray(psi0, dims=(2,) * self.N)
-
-    def compute_gradient(self, beta):
-        betanegs = np.zeros(2 * len(self.thetas))
-        betapos = np.zeros(2 * len(self.thetas))
-
-        for vals, b in ((betanegs, -beta), (betapos, beta)):
-            self.set_beta(b)
-            gs = self.ground_state()
-            for k, (i, j) in enumerate(self.thetas.keys()):
-                vals[2 * k] = float(dq.expect(self._XiXj(i, j, dq.sigmax), gs).real)
-                vals[2 * k + 1] = float(dq.expect(self._XiXj(i, j, dq.sigmaz), gs).real)
-
-        grad = 1 / (2 * beta) * (betapos - betanegs)
-        return grad
-
-    def train(self, data, rate, beta, n_epochs=1):
-        shuffled = data.copy()
-        costs = np.empty(len(data))
-        for _ in trange(n_epochs):
-            np.random.shuffle(shuffled)
-            for i in trange(len(shuffled)):
-                x = shuffled[i, 0:2]
-                y = shuffled[i, 2]
-                self.set_input({0: x[0], 1: x[1]})
-                self.set_cost({4: 1 if y == 0 else -1, 5: 1 if y == 1 else -1})
-                grad = self.compute_gradient(beta)
-                for k, (i, j) in enumerate(self.thetas.keys()):
-                    self.thetas[(i, j)] = (
-                        self.thetas[(i, j)][0] - rate * grad[2 * k],
-                        self.thetas[(i, j)][1] - rate * grad[2 * k + 1],
-                    )
-                self.set_lattice(self.thetas)
-
-                psi0 = self.ground_state()
-                costs[i] = float(dq.expect(self.C, psi0).real)
-
-            self.set_beta(0)
-            yield np.average(costs)
-
-
-N = 6
-beta = 1
-us = {0: 1, 1: 1}
-thetas = {
-    (0, 2): (1, 1),
-    (0, 3): (1, 1),
-    (1, 2): (1, 1),
-    (1, 3): (1, 1),
-    (2, 4): (1, 1),
-    (2, 5): (1, 1),
-    (3, 4): (1, 1),
-    (3, 5): (1, 1),
-}
-ds = {4: 1, 5: 1}
-
-h = QuantumEqPropagator(N, beta, thetas, us, ds)
-
-data = generate_spiral_data(samples=10, classes=2)
-
-costs = []
-for cost in h.train(data, 0.3, 0.1, n_epochs=3):
-    costs.append(cost)
-
-print(costs)
+    # Optionally keep the plot open after finishing
+    plt.ioff()
+    breakpoint()
