@@ -3,19 +3,19 @@ import networkx as nx
 import jax.numpy as jnp
 from functools import partial
 import numpy as np
-from tqdm import tqdm, trange
+from tqdm import trange
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import pickle as pkl
-import matplotlib.colors as mcolors
 
 sigmax = jnp.array([[0, 1], [1, 0]], dtype=jnp.complex64)
 sigmay = jnp.array([[0, -1j], [1j, 0]], dtype=jnp.complex64)
 sigmaz = jnp.array([[1, 0], [0, -1]], dtype=jnp.complex64)
 
 
-def debug_draw(N, n_in, n_out, keys, thetas, ax=None):
+def debug_draw(N, n_in, n_out, edges, thetas, ax=None):
     G = nx.Graph()
-    for theta, (i, j) in zip(thetas, keys):
+    for theta, (i, j) in zip(thetas, edges):
         G.add_edge(i, j)
     pos = nx.spring_layout(G)
     node_colors = [
@@ -101,26 +101,26 @@ def xi_xj(N, i, j, op):
 
 
 # @partial(jax.jit, static_argnums=(0, 1))
-def input_matrix(N, keys, uvals):
+def input_matrix(N, edges, uvals):
     total = jnp.zeros((2 ** N, 2 ** N), dtype=jnp.complex64)
-    for k, i in enumerate(keys):
+    for k, i in enumerate(edges):
         total += promote(N, i, sigmaz) * uvals[k]
     return total
 
 
 # @partial(jax.jit, static_argnums=(0, 1))
-def cost_matrix(N, keys, dvals):
+def cost_matrix(N, edges, dvals):
     total = jnp.zeros((2 ** N, 2 ** N), dtype=jnp.complex64)
-    for k, i in enumerate(keys):
+    for k, i in enumerate(edges):
         D = promote(N, i, sigmaz) - dvals[k] * jnp.eye(2 ** N)
         total += D @ D
     return total
 
 
 # @partial(jax.jit, static_argnums=(0, 1))
-def lattice_matrix(N, keys, thetas):
+def lattice_matrix(N, edges, thetas):
     total = jnp.eye(2 ** N, dtype=jnp.complex64)
-    for k, (i, j) in enumerate(keys):
+    for k, (i, j) in enumerate(edges):
         total += xi_xj(N, i, j, sigmax) * thetas[k, 0]
         total += xi_xj(N, i, j, sigmaz) * thetas[k, 1]
     return total
@@ -137,9 +137,9 @@ def resum(U, C, L, beta):
 
 
 # @partial(jax.jit, static_argnums=(0, 1))
-def xixj_expectations(N, keys, psi0):
-    res = jnp.zeros(2 * len(keys))
-    for k, (i, j) in enumerate(keys):
+def xixj_expectations(N, edges, psi0):
+    res = jnp.zeros(2 * len(edges))
+    for k, (i, j) in enumerate(edges):
         res = (
             res.at[2 * k]
             .set(jnp.real(dag(psi0) @ xi_xj(N, i, j, sigmax) @ psi0))
@@ -150,39 +150,39 @@ def xixj_expectations(N, keys, psi0):
 
 
 # @partial(jax.jit, static_argnums=(0, 1))
-def compute_gradient(N, keys, U, L, C, beta):
-    betanegs = jnp.zeros(2 * len(keys), dtype=jnp.float32)
-    betapos = jnp.zeros(2 * len(keys), dtype=jnp.float32)
+def compute_gradient(N, edges, U, L, C, beta):
+    betanegs = jnp.zeros(2 * len(edges), dtype=jnp.float32)
+    betapos = jnp.zeros(2 * len(edges), dtype=jnp.float32)
 
     H = U + L
     H_tot = H + (beta / 2) * C
     psi0 = smallest_eigvec(H_tot)
-    betapos = xixj_expectations(N, keys, psi0)
+    betapos = xixj_expectations(N, edges, psi0)
     H_tot = H - (beta / 2) * C
     psi0 = smallest_eigvec(H_tot)
-    betanegs = xixj_expectations(N, keys, psi0)
+    betanegs = xixj_expectations(N, edges, psi0)
 
     return (1 / (2 * beta)) * (betapos - betanegs)
 
 
 @partial(jax.jit, static_argnums=(0, 1, 2, 3))
-def singlestep(N, n_in, n_out, keys, thetas, xy, beta=0.01, rate=0.01):
-    u_keys = range(n_in)
-    d_keys = range(N - n_out, N)
-    L = lattice_matrix(N, keys, thetas)
-    U = input_matrix(N, u_keys, xy[:n_in])
-    C = cost_matrix(N, d_keys, xy[n_in:])
+def singlestep(N, n_in, n_out, edges, thetas, xy, beta=0.01, rate=0.01):
+    u_vertex = range(n_in)
+    d_vertex = range(N - n_out, N)
+    L = lattice_matrix(N, edges, thetas)
+    U = input_matrix(N, u_vertex, xy[:n_in])
+    C = cost_matrix(N, d_vertex, xy[n_in:])
 
-    grad = compute_gradient(N, keys, U, L, C, beta)
+    grad = compute_gradient(N, edges, U, L, C, beta)
     return thetas - rate * jnp.reshape(grad, thetas.shape)
 
 
 @partial(jax.jit, static_argnums=(0, 1, 2))
 def calccost(N, n_in, n_out, L, xy):
-    u_keys = range(n_in)
-    d_keys = range(N - n_out, N)
-    U = input_matrix(N, u_keys, xy[:n_in])
-    C = cost_matrix(N, d_keys, xy[n_in:])
+    u_vertex = range(n_in)
+    d_vertex = range(N - n_out, N)
+    U = input_matrix(N, u_vertex, xy[:n_in])
+    C = cost_matrix(N, d_vertex, xy[n_in:])
     H = U + L
     psi0 = smallest_eigvec(H)
     cost = jnp.real(dag(psi0) @ C @ psi0)
@@ -191,14 +191,14 @@ def calccost(N, n_in, n_out, L, xy):
 
 
 @partial(jax.jit, static_argnums=(0, 1, 2, 3))
-def predict_all(N, n_in, n_out, keys, thetas, x):
-    u_keys = range(n_in)
-    d_keys = range(N - n_out, N)
-    L = lattice_matrix(N, keys, thetas)
-    output_ops = [promote(N, i, sigmaz) for i in d_keys]
+def predict_all(N, n_in, n_out, edges, thetas, x):
+    u_vertex = range(n_in)
+    d_vertex = range(N - n_out, N)
+    L = lattice_matrix(N, edges, thetas)
+    output_ops = [promote(N, i, sigmaz) for i in d_vertex]
 
     def for_one(x):
-        U = input_matrix(N, u_keys, x)
+        U = input_matrix(N, u_vertex, x)
         H = U + L
         psi0 = smallest_eigvec(H)
         outputs = jnp.empty(n_out, dtype=jnp.complex64)
@@ -210,28 +210,28 @@ def predict_all(N, n_in, n_out, keys, thetas, x):
 
 
 @partial(jax.jit, static_argnums=(0, 1, 2, 3))
-def calcloss_cost(N, n_in, n_out, keys, thetas, testdata):
-    L = lattice_matrix(N, keys, thetas)
+def calcloss_cost(N, n_in, n_out, edges, thetas, testdata):
+    L = lattice_matrix(N, edges, thetas)
     costs = jax.vmap(partial(calccost, N, n_in, n_out, L))(testdata)
     return jnp.mean(costs)
 
 
-def calcloss_result(N, n_in, n_out, keys, thetas, testdata):
-    outputs = predict_all(N, n_in, n_out, keys, thetas, testdata[:, :n_in])
+def calcloss_result(N, n_in, n_out, edges, thetas, testdata):
+    outputs = predict_all(N, n_in, n_out, edges, thetas, testdata[:, :n_in])
     loss = jnp.mean(jnp.abs(jnp.sign(outputs) - testdata[:, n_in:])) / 2
     return loss
 
 
-def train(N, n_in, n_out, keys, traindata, testdata, thetas, n_epochs=100):
+def train(N, n_in, n_out, edges, traindata, testdata, thetas, n_epochs=100):
     shuffled = traindata.copy()
     rate = 0.001
     for _ in trange(n_epochs):
         permutation = np.random.permutation(len(shuffled))
         for i in permutation:
-            thetas = singlestep(N, n_in, n_out, keys, thetas, traindata[i], rate=rate)
+            thetas = singlestep(N, n_in, n_out, edges, thetas, traindata[i], rate=rate)
         rate *= 0.98
 
-        yield thetas, calcloss_cost(N, n_in, n_out, keys, thetas, testdata)
+        yield thetas, calcloss_cost(N, n_in, n_out, edges, thetas, testdata)
 
 
 def generate_spiral_data(samples=100, offset=np.array([0, 0]), classes=[-1, 1]):
@@ -257,16 +257,15 @@ def default_colorer(v):
 
 
 def draw_predictions(
-    sc, N, n_in, n_out, keys, thetas, dataset, colorer=default_colorer
+    sc, N, n_in, n_out, edges, thetas, dataset, colorer=default_colorer
 ):
-    predictions = predict_all(N, n_in, n_out, keys, thetas, dataset)
+    predictions = predict_all(N, n_in, n_out, edges, thetas, dataset)
     sc.set_array(predictions[:, 0].real)
 
 
 if __name__ == "__main__":
     N = 6
-    beta = 1
-    keys = (
+    edges = (
         (0, 2),
         (1, 2),
         (0, 3),
@@ -280,7 +279,7 @@ if __name__ == "__main__":
         (3, 5),
         (4, 5),
     )
-    thetas = jnp.array(np.random.rand(len(keys), 2))
+    thetas = jnp.array(np.random.rand(len(edges), 2))
 
     traindata = jnp.array(generate_spiral_data(samples=1000))
     testdata = jnp.array(generate_spiral_data(samples=100))
@@ -291,11 +290,34 @@ if __name__ == "__main__":
     plt.ion()
     fig, (ax1, ax3, ax2) = plt.subplots(1, 3, figsize=(12, 4))
     (line,) = ax1.plot([], [], "bo-")  # initial empty plot
-    debug_draw(N, 2, 1, keys, thetas, ax=ax2)
+    debug_draw(N, 2, 1, edges, thetas, ax=ax2)
     sc = ax3.scatter(*testdata[:, :2].T, cmap="coolwarm", c=testdata[:, 2])
+
+    ax1.set_title("Cost")
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Cost")
+
+    ax2.set_title("Qubit Network")
+    kwargs = dict(xdata=[0], ydata=[0], marker="o", markersize=15)
+    legend_elements = [
+        Line2D(
+            markerfacecolor=color,
+            label=label,
+            **kwargs,
+        )
+        for color, label in [
+            ("green", "Input"),
+            ("red", "Output"),
+            ("lightblue", "Hidden"),
+        ]
+    ]
+    ax2.legend(handles=legend_elements, loc="upper left")
+
+    ax3.set_title("Predictions")
+
     fig.canvas.draw()  # Update the figure
     fig.show()  # Show the figure
-    plt.pause(0.01)  # Pause to allow the plot to update
+    plt.pause(0.1)  # Pause to allow the plot to update
 
     # Lists to store points
     xdata, ydata = [], []
@@ -304,7 +326,7 @@ if __name__ == "__main__":
 
     # Process points from the generator
     for thetas, cost in train(
-        N, 2, 1, keys, traindata, testdata, thetas, n_epochs=1000
+        N, 2, 1, edges, traindata, testdata, thetas, n_epochs=1000
     ):
         n_epoch += 1
         x = len(costs)
@@ -319,7 +341,7 @@ if __name__ == "__main__":
         ax1.autoscale_view()  # Rescale the view to the new data
 
         if n_epoch % 3 == 0:
-            draw_predictions(sc, N, 2, 1, keys, thetas, testdata)
+            draw_predictions(sc, N, 2, 1, edges, thetas, testdata)
 
         fig.canvas.draw()  # Update the figure
         fig.show()  # Show the figure
@@ -329,7 +351,7 @@ if __name__ == "__main__":
             outdict = {
                 "N": N,
                 "thetas": thetas,
-                "keys": keys,
+                "edges": edges,
                 "costs": costs,
             }
             with open(f"costs_{n_epoch}.pkl", "wb") as f:
