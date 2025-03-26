@@ -224,10 +224,12 @@ def calcloss_result(N, n_in, n_out, keys, thetas, testdata):
 
 def train(N, n_in, n_out, keys, traindata, testdata, thetas, n_epochs=100):
     shuffled = traindata.copy()
-    for _ in range(n_epochs):
+    rate = 0.01
+    for _ in trange(n_epochs):
         permutation = np.random.permutation(len(shuffled))
         for i in permutation:
-            thetas = singlestep(N, n_in, n_out, keys, thetas, traindata[i], rate=0.005)
+            thetas = singlestep(N, n_in, n_out, keys, thetas, traindata[i], rate=rate)
+        rate *= 0.98
 
         yield thetas, calcloss_cost(N, n_in, n_out, keys, thetas, testdata)
 
@@ -262,7 +264,7 @@ def draw_predictions(
 
 
 if __name__ == "__main__":
-    N = 5
+    N = 6
     beta = 1
     keys = (
         (0, 2),
@@ -272,6 +274,11 @@ if __name__ == "__main__":
         (1, 3),
         (2, 4),
         (3, 4),
+        (0, 5),
+        (1, 5),
+        (2, 5),
+        (3, 5),
+        (4, 5),
     )
     thetas = jnp.array(np.random.rand(len(keys), 2))
 
