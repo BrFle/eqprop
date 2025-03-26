@@ -224,7 +224,7 @@ def calcloss_result(N, n_in, n_out, keys, thetas, testdata):
 
 def train(N, n_in, n_out, keys, traindata, testdata, thetas, n_epochs=100):
     shuffled = traindata.copy()
-    rate = 0.01
+    rate = 0.001
     for _ in trange(n_epochs):
         permutation = np.random.permutation(len(shuffled))
         for i in permutation:
@@ -268,14 +268,14 @@ if __name__ == "__main__":
     beta = 1
     keys = (
         (0, 2),
-        (0, 3),
         (1, 2),
+        (0, 3),
         (2, 3),
         (1, 3),
+        (0, 4),
+        (1, 4),
         (2, 4),
         (3, 4),
-        (0, 5),
-        (1, 5),
         (2, 5),
         (3, 5),
         (4, 5),
