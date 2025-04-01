@@ -7,6 +7,7 @@ from tqdm import trange
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 import pickle as pkl
+from sklearn.datasets import make_moons
 
 sigmax = jnp.array([[0, 1], [1, 0]], dtype=jnp.complex64)
 sigmay = jnp.array([[0, -1j], [1j, 0]], dtype=jnp.complex64)
@@ -177,6 +178,44 @@ def singlestep(N, n_in, n_out, edges, thetas, xy, beta=0.01, rate=0.01):
     return thetas - rate * jnp.reshape(grad, thetas.shape)
 
 
+@partial(jax.jit, static_argnums=(0, 1, 2, 3))
+def adamw_singlestep(
+    N,
+    n_in,
+    n_out,
+    edges,
+    thetas,
+    vs,
+    ms,
+    k_epoch,
+    xy,
+    beta=0.01,
+    r1=0.9,
+    r2=0.999,
+    eps=1e-8,
+    rate=0.001,
+    decay=0.01,
+):
+    u_vertex = range(n_in)
+    d_vertex = range(N - n_out, N)
+    L = lattice_matrix(N, edges, thetas)
+    U = input_matrix(N, u_vertex, xy[:n_in])
+    C = cost_matrix(N, d_vertex, xy[n_in:])
+
+    grad = jnp.reshape(compute_gradient(N, edges, U, L, C, beta), thetas.shape)
+
+    ms = r1 * ms + (1 - r1) * grad
+    vs = r2 * vs + (1 - r2) * grad ** 2
+
+    mhat = ms / (1 - r1 ** k_epoch)
+    vhat = vs / (1 - r2 ** k_epoch)
+
+    update = rate * mhat / (jnp.sqrt(vhat) + eps)
+
+    thetas = thetas * (1 - rate * decay) - update
+    return thetas, vs, ms
+
+
 @partial(jax.jit, static_argnums=(0, 1, 2))
 def calccost(N, n_in, n_out, L, xy):
     u_vertex = range(n_in)
@@ -229,7 +268,21 @@ def train(N, n_in, n_out, edges, traindata, testdata, thetas, n_epochs=100):
         permutation = np.random.permutation(len(shuffled))
         for i in permutation:
             thetas = singlestep(N, n_in, n_out, edges, thetas, traindata[i], rate=rate)
-        rate *= 0.98
+        rate *= 0.99
+
+        yield thetas, calcloss_cost(N, n_in, n_out, edges, thetas, testdata)
+
+
+def adamw_train(N, n_in, n_out, edges, traindata, testdata, thetas, n_epochs=100):
+    shuffled = traindata.copy()
+    ms = jnp.zeros_like(thetas)
+    vs = jnp.zeros_like(thetas)
+    for k in trange(1, n_epochs + 1):
+        permutation = np.random.permutation(len(shuffled))
+        for i in permutation:
+            thetas, vs, ms = adamw_singlestep(
+                N, n_in, n_out, edges, thetas, vs, ms, k, traindata[i]
+            )
 
         yield thetas, calcloss_cost(N, n_in, n_out, edges, thetas, testdata)
 
@@ -252,6 +305,17 @@ def generate_spiral_data(samples=100, offset=np.array([0, 0]), classes=[-1, 1]):
     return X
 
 
+def generate_moons_data(
+    samples=100, noise=0.1, offset=np.array([0, 0]), classes=[-1, 1]
+):
+    X, y = make_moons(n_samples=samples, noise=noise)
+    X += offset
+    y = np.array([classes[label] for label in y])
+    data = np.hstack((X, y.reshape(-1, 1)))
+
+    return data
+
+
 def default_colorer(v):
     return "red" if v[0].real > 0 else "blue"
 
@@ -265,24 +329,26 @@ def draw_predictions(
 
 if __name__ == "__main__":
     N = 6
+    # edges = tuple([(i, j) for i in range(N) for j in range(i + 1, N)])
     edges = (
         (0, 2),
-        (1, 2),
         (0, 3),
-        (2, 3),
-        (1, 3),
         (0, 4),
+        (1, 2),
+        (1, 3),
         (1, 4),
-        (2, 4),
+        (2, 3),
         (3, 4),
+        (4, 2),
         (2, 5),
         (3, 5),
         (4, 5),
     )
     thetas = jnp.array(np.random.rand(len(edges), 2))
 
-    traindata = jnp.array(generate_spiral_data(samples=1000))
-    testdata = jnp.array(generate_spiral_data(samples=100))
+    dataset = generate_spiral_data
+    traindata = jnp.array(dataset(samples=1000))
+    testdata = jnp.array(dataset(samples=100))
 
     costs = []
 
@@ -314,6 +380,7 @@ if __name__ == "__main__":
     ax2.legend(handles=legend_elements, loc="upper left")
 
     ax3.set_title("Predictions")
+    fig.tight_layout()
 
     fig.canvas.draw()  # Update the figure
     fig.show()  # Show the figure
@@ -325,7 +392,7 @@ if __name__ == "__main__":
     n_epoch = 0
 
     # Process points from the generator
-    for thetas, cost in train(
+    for thetas, cost in adamw_train(
         N, 2, 1, edges, traindata, testdata, thetas, n_epochs=1000
     ):
         n_epoch += 1
