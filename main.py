@@ -370,7 +370,6 @@ def experiment(
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     write_dir = f"results/{dataset}_{scheduler}_{idstr}_{timestamp}_{N}"
     os.makedirs(write_dir, exist_ok=True)
-    os.chdir(write_dir)
 
     testdata = jnp.array(dataset_function(samples=test_samples))
     traindata = jnp.array(dataset_function(samples=samples))
@@ -389,7 +388,7 @@ def experiment(
             "costs": costs,
             **kwargs,
         }
-        with open(f"costs_{n_epoch}.pkl", "wb") as f:
+        with open(f"{write_dir}/costs_{n_epoch}.pkl", "wb") as f:
             pkl.dump(outdict, f)
 
     for thetas, cost in train_function(
