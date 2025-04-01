@@ -1,17 +1,27 @@
 import jax
-import networkx as nx
 import jax.numpy as jnp
-from functools import partial
 import numpy as np
+from sklearn.datasets import make_moons
 from tqdm import trange
 from tqdm.contrib.concurrent import process_map
+import networkx as nx
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 import pickle as pkl
-from sklearn.datasets import make_moons
 from datetime import datetime
+from functools import partial
 import os
 import multiprocessing as mp
+import random
+import string
+import time
+
+
+def random_id_str():
+    return "".join(
+        random.Random(os.getpid() + int(time.time())).choices(string.ascii_letters, k=5)
+    )
+
 
 sigmax = jnp.array([[0, 1], [1, 0]], dtype=jnp.complex64)
 sigmay = jnp.array([[0, -1j], [1j, 0]], dtype=jnp.complex64)
@@ -344,6 +354,7 @@ def experiment(
     n_epochs=200,
     **kwargs,
 ):
+    idstr = random_id_str()
     dataset_function = {
         "spiral": generate_spiral_data,
         "moons": generate_moons_data,
@@ -357,7 +368,7 @@ def experiment(
         edges = tuple([(i, j) for i in range(N) for j in range(i + 1, N)])
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    write_dir = f"results/{dataset}_{scheduler}_{timestamp}_{N}_{n_in}_{n_out}"
+    write_dir = f"results/{dataset}_{scheduler}_{idstr}_{timestamp}_{N}"
     os.makedirs(write_dir, exist_ok=True)
     os.chdir(write_dir)
 
@@ -520,19 +531,16 @@ if __name__ == "__main__":
             (3, 5),
             (4, 5),
         ),
+        "dataset": "spiral",
+        "n_epochs": 200,
+        "write_freq": 5,
     }
     adam_exp = {
         **kwargs,
         "scheduler": "adamw",
-        "dataset": "spiral",
-        "n_epochs": 200,
-        "write_freq": 5,
     }
     vanilla_exp = {
         **kwargs,
         "scheduler": "vanilla",
-        "dataset": "spiral",
-        "n_epochs": 200,
-        "write_freq": 5,
     }
-    schedule_experiments([adam_exp, vanilla_exp] * 30)
+    schedule_experiments([adam_exp, vanilla_exp] * 50)
