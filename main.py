@@ -4,10 +4,14 @@ import jax.numpy as jnp
 from functools import partial
 import numpy as np
 from tqdm import trange
+from tqdm.contrib.concurrent import process_map
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 import pickle as pkl
 from sklearn.datasets import make_moons
+from datetime import datetime
+import os
+import multiprocessing as mp
 
 sigmax = jnp.array([[0, 1], [1, 0]], dtype=jnp.complex64)
 sigmay = jnp.array([[0, -1j], [1j, 0]], dtype=jnp.complex64)
@@ -327,7 +331,76 @@ def draw_predictions(
     sc.set_array(predictions[:, 0].real)
 
 
-if __name__ == "__main__":
+def experiment(
+    N=6,
+    n_in=2,
+    n_out=1,
+    dataset="spiral",
+    scheduler="adamw",
+    samples=1000,
+    test_samples=100,
+    edges=None,
+    write_freq=1,
+    n_epochs=200,
+    **kwargs,
+):
+    dataset_function = {
+        "spiral": generate_spiral_data,
+        "moons": generate_moons_data,
+    }[dataset]
+    train_function = {
+        "adamw": adamw_train,
+        "vanilla": train,
+    }[scheduler]
+
+    if edges is None:
+        edges = tuple([(i, j) for i in range(N) for j in range(i + 1, N)])
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    write_dir = f"results/{dataset}_{scheduler}_{timestamp}_{N}_{n_in}_{n_out}"
+    os.makedirs(write_dir, exist_ok=True)
+    os.chdir(write_dir)
+
+    testdata = jnp.array(dataset_function(samples=test_samples))
+    traindata = jnp.array(dataset_function(samples=samples))
+
+    n_epoch = 0
+    costs = []
+    thetas = jnp.array(np.random.rand(len(edges), 2))
+
+    def write_out():
+        outdict = {
+            "N": N,
+            "n_in": n_in,
+            "n_out": n_out,
+            "thetas": thetas,
+            "edges": edges,
+            "costs": costs,
+            **kwargs,
+        }
+        with open(f"costs_{n_epoch}.pkl", "wb") as f:
+            pkl.dump(outdict, f)
+
+    for thetas, cost in train_function(
+        N, n_in, n_out, edges, traindata, testdata, thetas, n_epochs=n_epochs
+    ):
+        costs.append(cost)
+        if n_epoch % write_freq == 0:
+            write_out()
+        n_epoch += 1
+    write_out()
+    os.chdir("..")
+
+
+def experiment_wrapper(kwargs):
+    experiment(**kwargs)
+
+
+def schedule_experiments(exps):
+    process_map(experiment_wrapper, exps, max_workers=7)
+
+
+def main():
     N = 6
     # edges = tuple([(i, j) for i in range(N) for j in range(i + 1, N)])
     edges = (
@@ -346,7 +419,7 @@ if __name__ == "__main__":
     )
     thetas = jnp.array(np.random.rand(len(edges), 2))
 
-    dataset = generate_spiral_data
+    dataset = generate_moons_data
     traindata = jnp.array(dataset(samples=1000))
     testdata = jnp.array(dataset(samples=100))
 
@@ -427,3 +500,39 @@ if __name__ == "__main__":
     # Optionally keep the plot open after finishing
     plt.ioff()
     breakpoint()
+
+
+if __name__ == "__main__":
+    mp.set_start_method("spawn")
+    kwargs = {
+        "N": 6,
+        "edges": (
+            (0, 2),
+            (0, 3),
+            (0, 4),
+            (1, 2),
+            (1, 3),
+            (1, 4),
+            (2, 3),
+            (3, 4),
+            (4, 2),
+            (2, 5),
+            (3, 5),
+            (4, 5),
+        ),
+    }
+    adam_exp = {
+        **kwargs,
+        "scheduler": "adamw",
+        "dataset": "spiral",
+        "n_epochs": 200,
+        "write_freq": 5,
+    }
+    vanilla_exp = {
+        **kwargs,
+        "scheduler": "vanilla",
+        "dataset": "spiral",
+        "n_epochs": 200,
+        "write_freq": 5,
+    }
+    schedule_experiments([adam_exp, vanilla_exp] * 30)
